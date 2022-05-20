@@ -71,48 +71,46 @@ class AnalysisPcap(object):
         pp = ['%02X' % i for i in content]
         copmlete_packet = "".join(pp)       
         print("head:%s video:%d audio:%d flag:%x type:%x pkg:%d %x seq:%d" % (head_4bytes, self.video_frames, self.audio_frames, flag, ftype, rtp_len, rtp_len, rtp_seq))        
-        logger.info("head:%s len:%d_%d video:%d audio:%d flag:%x type:%x rtp:%d %x seq:%d flow:%d len:%d" % (head_4bytes, len(head_4bytes), len(content), self.video_frames, 
-                    self.audio_frames, flag, ftype, rtp_len, rtp_len, rtp_seq, self.stream_flow, len(self.data_content)))     
+        logger.info("head:%s len:%d_%d video:%d audio:%d flag:%x type:%x rtp:%d %x seq:%d flow:%d len:%d left:%d" % (head_4bytes, len(head_4bytes), len(content), self.video_frames, 
+                    self.audio_frames, flag, ftype, rtp_len, rtp_len, rtp_seq, self.stream_flow, len(self.data_content), len(self.left_packet)))     
         logger.info("".join(pp))
         # 若首字节不是0x24说明这个包属于上个粘包剩余部分数据, 需要将这个包附加到left_packet
         if 0x24 != flag:
+            index = 0
             self.left_packet += "".join(pp)
-            logger.warning("recv part data,len:%d content:%s" % (len_content, copmlete_packet))
+            # 循环处理缓存buf, 将buf中所有完整包一次转移到data_content中
+            while len(self.left_packet) >= 32 :
+                left_head_4bytes = self.left_packet[0:24]
+                left_flag = int(self.left_packet[index:index+2], 16)
+                left_ftype = int(self.left_packet[index+2:index+4], 16)
+                left_rtp_len = int(self.left_packet[index+4:index+8], 16)        
+                left_rtp_seq = int(self.left_packet[index+12:index+16], 16)
+                logger.warning("recv incomplete packet,head:%s flag:%x type:%x rtp:%d %x seq:%d len:%d left:%d" % (left_head_4bytes,left_flag,left_ftype,left_rtp_len,
+                                left_rtp_len,left_rtp_seq,len(self.data_content),len(self.left_packet)))
+                if len(self.left_packet) >= ((left_rtp_len + 4)*2):
+                    # 粘包数据够一个完整包时需要将该部分数据移动到data_content
+                    self.data_content += self.left_packet[0:(left_rtp_len+4)*2]
+                    self.left_packet = self.left_packet[(left_rtp_len+4)*2:]
+                    # 统计粘包帧信息
+                    if 0x0 == left_ftype :
+                        self.video_frames += 1
+                        drop_frame_num = left_rtp_seq - self.vframe_seq - 1
+                        if drop_frame_num > 0 and self.vframe_seq > 0 :
+                            self.drop_vframes += drop_frame_num
+                            logger.warning("WARN! drop left video frame nums:%d,cur:%d last:%d" % (drop_frame_num, left_rtp_seq, self.vframe_seq))
+                        self.vframe_seq = left_rtp_seq 
+                    elif 0x2 == left_ftype :
+                        self.audio_frames += 1
+                    self.stream_flow += (left_rtp_len+4)
+                    logger.info("move one complete packet to main,len:%d left:%d rtp:%d seq:%d flow:%d video:%d audio:%d", len(self.data_content), len(self.left_packet), 
+                                left_rtp_len, left_rtp_seq,self.stream_flow,self.video_frames,self.audio_frames)
+                else:
+                    return
             return
         
         # 首字节为0x24说明之前的粘包已全部收齐, 若存在历史粘包数据则先将粘包数据转移到data_content上
-        len_left_content = len(self.left_packet)
-        if len_left_content > 0 :
-            index = 0
-            left_head_4bytes = self.left_packet[0:24]
-            left_flag = int(self.left_packet[index:index+2], 16)
-            left_ftype = int(self.left_packet[index+2:index+4], 16)
-            left_rtp_len = int(self.left_packet[index+4:index+8], 16)        
-            left_rtp_seq = int(self.left_packet[index+12:index+16], 16)
-            self.data_content += self.left_packet
-            logger.info("add left packet to main,len:%d %d head:%s flag:%x type:%x rtp:%d %x seq:%d" % (len(self.data_content), len_left_content,
-                            left_head_4bytes, left_flag, left_ftype, left_rtp_len, left_rtp_len, left_rtp_seq))           
-            # 统计粘包帧信息
-            if 0x0 == left_ftype :
-                self.video_frames += 1
-                drop_frame_num = left_rtp_seq - self.vframe_seq - 1
-                if drop_frame_num > 0 and self.vframe_seq > 0 :
-                    self.drop_vframes += drop_frame_num
-                    print("WARN! drop left video frame nums:%d,cur:%d last:%d" % (drop_frame_num, rtp_seq, self.vframe_seq))
-                    logger.warning("WARN! drop left video frame nums:%d,cur:%d last:%d" % (drop_frame_num, rtp_seq, self.vframe_seq))
-                self.vframe_seq = left_rtp_seq 
-            elif 0x2 == left_ftype :
-                self.audio_frames += 1
-            self.stream_flow += len_left_content
-            self.left_packet = ''
-
         # 先将前面完整的rtp包转移到data_content
         self.data_content += copmlete_packet[0:(rtp_len+4)*2]
-        # 若rtp长度+4字节rtptcp长度小于包长度说明存在粘包, 需要将不完整的数据保存到left
-        if rtp_len + 4 < len_content:
-            self.left_packet += copmlete_packet[(rtp_len+4)*2:] 
-            logger.info("save left part packet:%s" % (self.left_packet))           
-
         # 音视频帧信息统计
         if 0x0 == ftype :
             self.video_frames += 1
@@ -124,8 +122,35 @@ class AnalysisPcap(object):
             self.vframe_seq = rtp_seq 
         elif 0x2 == ftype :
             self.audio_frames += 1
-
-        self.stream_flow += (rtp_len+4)*2
+        self.stream_flow += (rtp_len+4)    
+        # 若rtp长度+4字节rtptcp长度小于包长度说明存在粘包, 需要将不完整的数据保存到left
+        if rtp_len + 4 < len_content:
+            self.left_packet += copmlete_packet[(rtp_len+4)*2:] 
+            index = 0
+            left_head_4bytes = self.left_packet[0:24]
+            left_flag = int(self.left_packet[index:index+2], 16)
+            left_ftype = int(self.left_packet[index+2:index+4], 16)
+            left_rtp_len = int(self.left_packet[index+4:index+8], 16)        
+            left_rtp_seq = int(self.left_packet[index+12:index+16], 16)
+            # 若粘包数据够一个完整包则将完整包数据转移到data
+            if (left_rtp_len+4)*2 <= len(self.left_packet):
+                self.data_content += self.left_packet[0:(left_rtp_len+4)*2]                
+                self.left_packet = self.left_packet[(left_rtp_len+4)*2:]
+                # 统计粘包帧信息
+                if 0x0 == left_ftype :
+                    self.video_frames += 1
+                    drop_frame_num = left_rtp_seq - self.vframe_seq - 1
+                    if drop_frame_num > 0 and self.vframe_seq > 0 :
+                        self.drop_vframes += drop_frame_num
+                        logger.warning("WARN! drop left video frame nums:%d,cur:%d last:%d" % (drop_frame_num, left_rtp_seq, self.vframe_seq))
+                    self.vframe_seq = left_rtp_seq 
+                elif 0x2 == left_ftype :
+                    self.audio_frames += 1
+                self.stream_flow += (left_rtp_len+4)
+                logger.info("move complete left packet to main,len:%d left:%d rtp:%d seq:%d flow:%d" % (len(self.data_content), len(self.left_packet),
+                            left_rtp_len,left_rtp_seq, self.stream_flow))
+            else:
+                logger.info("save left incomplete rtp:%d seq:%d len:%d left:%d info:%s" % (rtp_len, left_rtp_seq, len_content, len(self.left_packet), self.left_packet))           
         return
 
     def parseRtspDataV2(self, content):
